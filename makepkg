@@ -1,515 +1,297 @@
-#!/bin/bash
+#!/bin/sh
+# srcmgr — gerenciador de programas source-based, POSIX puro, LFS-friendly
+# - receitas em VARIÁVEIS (sem funções) dentro de $REPO/repo/<cat>/*.rc
+# - baixa (curl/wget/git), extrai, aplica patches, resolve dependências,
+#   compila, instala com DESTDIR (fakeroot), empacota, registra manifesto,
+#   remove, lista, info, update do repo git, rebuild global ordenando deps,
+#   build-only (sem instalar), cores, spinner e logs.
+#
+# Uso básico:
+#   srcmgr install <nome>          # compila+instala um pacote
+#   srcmgr build   <nome>          # compila sem instalar
+#   srcmgr fetch   <nome>          # apenas baixar fontes
+#   srcmgr extract <nome>          # baixar + extrair
+#   srcmgr patch   <nome>          # aplicar patches (após extract)
+#   srcmgr deps    <nome>          # resolver/instalar dependências
+#   srcmgr remove  <nome[-ver]>    # desinstalar
+#   srcmgr list                     # listar instalados
+#   srcmgr info   <nome[-ver]>     # informações do pacote instalado
+#   srcmgr update                   # git pull do repositório de receitas
+#   srcmgr rebuild [--force]        # recompilar tudo, ordenando dependências
+#   srcmgr graph   <nome>           # imprime a árvore de deps
+#   srcmgr prepare <nome>           # fetch+extract+patch+deps (não compila)
+#
+# Flags globais:
+#   --force         força rebuild/reinstalação mesmo se instalado
+#   --no-color      desativa cores
+#   --no-spinner    desativa spinner
+#
+# Estrutura esperada do repositório de receitas (exemplo):
+#   $REPO/
+#     .git
+#     repo/
+#       base/
+#         hello.rc
+#         gcc.rc
+#       extra/
+#         firefox.rc
+#
+# Formato de receita (apenas variáveis), ex. hello.rc:
+#   PKG="hello"; VER="2.12"
+#   SRC="https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz"
+#   SHA256="<hash>"
+#   PATCHES="\n# patches/fix.patch\n"
+#   DEPS=""
+#   CONFIGURE="./configure --prefix=\${PREFIX}"
+#   MAKE="make -j\${JOBS}"
+#   MAKE_INSTALL="make DESTDIR=\"\${DESTDIR}\" install"
+#   POST_INSTALL=""   # comandos no ROOT após instalar
+#   REMOVE_CMDS=""    # comandos no ROOT ao remover (systemd, users, etc.)
 
-CWD=$(pwd)
+set -eu
+
+############################ Configuração padrão ###############################
+: "${ROOT:=/}"
+: "${REPO:=${PWD}}"
+: "${RECIPES_DIR:=${REPO}/repo}"      # onde ficam subpastas (base, extra, ...)
+: "${WORK:=${PWD}/work}"
+: "${DL:=${PWD}/distfiles}"
+: "${DESTDIR:=${PWD}/dest}"
+: "${PKGDIR:=${PWD}/packages}"
+: "${VARDB:=/var/lib/srcmgr}"         # DB local
+: "${LOGDIR:=${PWD}/logs}"
+: "${JOBS:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+: "${PKGCOMP:=gz}"                    # gz|zst|xz
 
 umask 022
 
-# Diretórios automáticos
-REPO="${REPO:-$HOME/recipes}"
-WORK="${WORK:-$HOME/work}"
-BIN="${BIN:-$HOME/bin}"
+############################ Aparência (cores) ################################
+USE_COLOR=1; USE_SPINNER=1
+for a in "$@"; do case "$a" in --no-color) USE_COLOR=0;; --no-spinner) USE_SPINNER=0;; esac; done
+if [ -t 2 ] && [ "${USE_COLOR}" -eq 1 ]; then
+  c_reset="\033[0m"; c_bold="\033[1m"; c_dim="\033[2m"; c_red="\033[31m"; c_green="\033[32m";
+  c_yel="\033[33m"; c_cyan="\033[36m"; c_mag="\033[35m";
+else c_reset=""; c_bold=""; c_dim=""; c_red=""; c_green=""; c_yel=""; c_cyan=""; c_mag=""; fi
 
-mkdir -p "$WORK" "$BIN"
+log() { printf "%s%s[*]%s %s\n" "$c_cyan" "$c_bold" "$c_reset" "$*" >&2; }
+ok()  { printf "%s%s[OK]%s %s\n" "$c_green" "$c_bold" "$c_reset" "$*" >&2; }
+warn(){ printf "%s[!]%s %s\n" "$c_yel" "$c_reset" "$*" >&2; }
+die(){ printf "%s%s[x]%s %s\n" "$c_red" "$c_bold" "$c_reset" "$*" >&2; exit 1; }
 
-make_install_script() {
-  TAB="$(echo -e "\t")"
-  COUNT=1
-  while :; do
-   LINE="$(sed -n "$COUNT p" $1)"
-   if [ "$LINE" = "" ]; then
-    break
-   fi
-   LINKGOESIN="$(echo "$LINE" | cut -f 1 -d "$TAB")" 
-   LINKGOESIN="$(dirname "$LINKGOESIN")" 
-   LINKNAMEIS="$(echo "$LINE" | cut -f 1 -d "$TAB")"
-   LINKNAMEIS="$(basename "$LINKNAMEIS")"
-   LINKPOINTSTO="$(echo "$LINE" | cut -f 2 -d "$TAB")"
-   echo "( cd $LINKGOESIN ; rm -rf $LINKNAMEIS )"
-   echo "( cd $LINKGOESIN ; ln -sf $LINKPOINTSTO $LINKNAMEIS )"
-   COUNT=$(expr $COUNT + 1)
+############################## Utilidades #####################################
+mkpaths(){ mkdir -p "$WORK" "$DL" "$DESTDIR" "$PKGDIR" "$VARDB/installed" "$LOGDIR"; }
+sha256tool(){ command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256"; }
+
+# Spinner simples: spinner "msg" -- cmd...
+spinner(){ if [ "$USE_SPINNER" -ne 1 ]; then shift; sh -c "$*"; return $?; fi
+  msg="$1"; shift; printf "%s%s..%s " "$c_dim" "$msg" "$c_reset" >&2
+  (
+    sh -c "$*"
+  ) & pid=$!
+  i=0; chars='|/-\\'
+  while kill -0 $pid 2>/dev/null; do i=$(( (i+1)%4 )); printf "\r%s%s %s%s" "$c_dim" "${msg}" "${chars:$i:1}" "$c_reset" >&2; sleep 0.1; done
+  wait $pid; rc=$?
+  if [ $rc -eq 0 ]; then printf "\r%*s\r" $(( ${#msg} + 4 )) "" >&2; ok "$msg"; else printf "\r%*s\r" $(( ${#msg} + 4 )) "" >&2; die "$msg falhou"; fi
+  return $rc
+}
+
+# Exec com log (tee) — abre/usa $LOGFILE se definido
+run(){ if [ -n "${LOGFILE:-}" ]; then ( sh -c "$*" ) 2>&1 | tee -a "$LOGFILE"; else sh -c "$*"; fi }
+
+stamp(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+############################# Carregar receita ################################
+# Procura <nome>.rc nas subpastas de $RECIPES_DIR
+find_recipe(){ name="$1"; case "$name" in *.rc) : ;; *) name="$1.rc";; esac
+  # caminho direto?
+  if [ -f "$name" ]; then echo "$name"; return 0; fi
+  if [ -f "$RECIPES_DIR/$name" ]; then echo "$RECIPES_DIR/$name"; return 0; fi
+  # busca nas subpastas
+  f=$(find "$RECIPES_DIR" -maxdepth 2 -type f -name "$name" | head -n1 || true)
+  [ -n "$f" ] || die "receita não encontrada: $1"
+  echo "$f"
+}
+
+load_rc(){ RCFILE=$(find_recipe "$1"); RECDIR=$(CDPATH= cd -- "$(dirname -- "$RCFILE")" && pwd)
+  # shellcheck disable=SC1090
+  set -a; . "$RCFILE"; set +a
+  : "${PKG:?defina PKG}"
+  : "${VER:?defina VER}"
+  : "${SRC:?defina SRC}"
+  : "${CONFIGURE:=}"
+  : "${MAKE:=}"
+  : "${MAKE_INSTALL:=}"
+  : "${PATCHES:=}"
+  : "${DEPS:=}"
+  : "${SHA256:=}"
+  : "${SHA256_FILES:=}"
+  : "${BUILD_DIR:=}"
+  : "${POST_INSTALL:=}"
+  : "${REMOVE_CMDS:=}"
+  PKGID="${PKG}-${VER}"
+}
+
+is_installed(){ [ -d "$VARDB/installed/$1" ]; }
+mark_installed(){ instdir="$VARDB/installed/${PKGID}"; mkdir -p "$instdir"; echo "PKG=$PKG\nVER=$VER\nTIME=$(stamp)" > "$instdir/meta"; cp "$RCFILE" "$instdir/recipe.rc" 2>/dev/null || true; }
+
+############################## Download/Verify ################################
+file_from_url(){ b=$(basename "$1"); printf '%s\n' "$b" | sed 's/[?].*$//' ; }
+fetch_one(){ u="$1"
+  case "$u" in
+    git+http://*|git+https://*|git+ssh://*|*.git)
+      need git; url=$(printf '%s' "$u" | sed 's#^git\+##'); name=$(basename "$url" .git)
+      tgt="$WORK/${name}.git"
+      if [ -d "$tgt" ]; then log "git fetch: $url"; (cd "$tgt" && git fetch --all --tags --prune) ; else log "git clone --mirror: $url"; git clone --mirror "$url" "$tgt"; fi ;;
+    http://*|https://*|ftp://*)
+      out="$DL/$(file_from_url "$u")"; if [ -f "$out" ]; then ok "já baixado: $(basename "$out")"; else
+        if command -v curl >/dev/null 2>&1; then spinner "baixando $(basename "$out")" "curl -fL --retry 3 -o '$out' '$u'"; else spinner "baixando (wget) $(basename "$out")" "wget -O '$out' '$u'"; fi; fi ;;
+    /*|./*|../*) cp -n "$u" "$DL/" 2>/dev/null || true ;;
+    *) die "SRC desconhecido: $u" ;;
+  esac
+}
+
+verify_sha(){ s256=$(sha256tool)
+  [ -z "${SHA256:-}${SHA256_FILES:-}" ] && { warn "sem SHA256"; return 0; }
+  if [ -n "${SHA256:-}" ]; then f=$(file_from_url $(echo "$SRC" | awk 'NF{print; exit}'))
+    (cd "$DL" && echo "$SHA256  $f" | $s256 -c -) || die "SHA256 falhou: $f"; ok "SHA256 OK: $f"; fi
+  if [ -n "${SHA256_FILES:-}" ]; then echo "$SHA256_FILES" | while IFS= read -r ln; do [ -z "$ln" ] && continue; f=$(printf '%s' "$ln" | cut -d= -f1); h=$(printf '%s' "$ln" | cut -d= -f2-); (cd "$DL" && echo "$h  $f" | $s256 -c -) || die "SHA256 falhou: $f"; ok "SHA256 OK: $f"; done; fi
+}
+
+need(){ command -v "$1" >/dev/null 2>&1 || die "comando requerido: $1"; }
+
+extract_one(){ s="$1"
+  case "$s" in
+    *.git) name=$(basename "$s" .git); out="$WORK/src/$PKGID-$name"; mkdir -p "$WORK/src"; if [ -d "$out/.git" ]; then log "git update $name"; (cd "$out" && git fetch && git reset --hard origin/HEAD 2>/dev/null || true); else log "git clone $name"; git clone "$s" "$out"; fi ;;
+    *.tar.gz|*.tgz)   mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar -xzf '$s' -C '$WORK/src'" ;;
+    *.tar.bz2|*.tbz2) mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar -xjf '$s' -C '$WORK/src'" ;;
+    *.tar.xz|*.txz)   mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar -xJf '$s' -C '$WORK/src'" ;;
+    *.tar.zst|*.tzst) mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar --zstd -xpf '$s' -C '$WORK/src'" ;;
+    *.zip)            mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "(cd '$WORK/src' && unzip -q '$s')" ;;
+    *.gz)             mkdir -p "$WORK/src"; run "gunzip -c '$s' > '$WORK/src/$(basename "$s" .gz)'" ;;
+    *.bz2)            mkdir -p "$WORK/src"; run "bunzip2 -c '$s' > '$WORK/src/$(basename "$s" .bz2)'" ;;
+    *.xz)             mkdir -p "$WORK/src"; run "unxz -c '$s' > '$WORK/src/$(basename "$s" .xz)'" ;;
+    *.zst)            mkdir -p "$WORK/src"; run "zstd -d -c '$s' > '$WORK/src/$(basename "$s" .zst)'" ;;
+    *) warn "ignorado: $(basename "$s")" ;;
+  esac
+}
+
+apply_patches(){ [ -n "${PATCHES}" ] || { ok "sem patches"; return 0; } ; need patch
+  for p in $PATCHES; do case "$p" in /*) patchfile="$p";; *) patchfile="$RECDIR/$p";; esac
+    [ -f "$patchfile" ] || die "patch não encontrado: $p"
+    log "patch: $(basename "$patchfile")"; (cd "$SRCDIR" && patch -p1 < "$patchfile")
   done
 }
 
-usage() {
-  cat << EOF
-
-Usage: makepkg package_name.tgz
-       (or: package_name.tbz, package_name.tlz, package_name.txz)
-
-Makes a Slackware compatible package containing the contents of the current
-and all subdirectories. If symbolic links exist, they will be removed and
-an installation script will be made to recreate them later. This script will
-be called "install/doinst.sh". You may add any of your own ash-compatible
-shell scripts to this file and rebuild the package if you wish.
-
-options:  -l, --linkadd y|n (moves symlinks into doinst.sh: recommended)
-          -p, --prepend (prepend rather than append symlinks to an existing
-               doinst.sh.  Useful to link libraries needed by programs in
-               the doinst.sh script)
-          -c, --chown y|n (resets all permissions to root:root 755 - not
-               generally recommended)
-          --threads <number> For xz/plzip compressed packages, set the max
-               number of threads to be used for compression. Only has an
-               effect on large packages. For plzip, the default is equal to
-               the number of CPU threads available on the machine. For xz,
-               the default is equal to 2 (due to commonly occuring memory
-               related failures when using many threads with multi-threaded
-               xz compression).
-          --compress <option> Supply a custom option to the compressor.
-               This will be used in place of the default, which is: -9
-          --acls Support storing POSIX ACLs in the package. The resulting
-               package will not be compatible with pkgtools version < 15.0.
-          --xattrs Support storing extended attributes in the package. The
-               resulting package will not be compatible with pkgtools
-               version < 15.0.
-          --remove-rpaths (remove all rpaths from ELF objects)
-          --remove-tmp-rpaths (remove rpaths from ELF objects if we find one
-               that contains '/tmp')
-
-If these options are not set, makepkg will prompt if appropriate.
-EOF
+find_srcdir(){ if [ -n "${BUILD_DIR}" ] && [ -d "$BUILD_DIR" ]; then SRCDIR="$BUILD_DIR"; return; fi
+  guess="$WORK/src/${PKG}-${VER}"; if [ -d "$guess" ]; then SRCDIR="$guess"; return; fi
+  d=$(find "$WORK/src" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1 || true)
+  [ -n "$d" ] || die "SRCDIR não encontrado (defina BUILD_DIR)"; SRCDIR="$d"
 }
 
-TMP=/tmp # This can be a hole, but I'm going to be careful about file
-         # creation in there, so don't panic. :^)
+################################# Etapas ######################################
+cmd_fetch(){ mkpaths; load_rc "$1"; LOGFILE="$LOGDIR/${PKGID}-fetch.log"; for u in $SRC; do fetch_one "$u"; done; verify_sha; }
+cmd_extract(){ cmd_fetch "$1"; LOGFILE="$LOGDIR/${PKGID}-extract.log"; for u in $SRC; do case "$u" in *.git|git+*) extract_one "$(printf '%s' "$u" | sed 's#^git\+##')" ;; http*|ftp*) extract_one "$DL/$(file_from_url "$u")" ;; /*|./*|../*) extract_one "$DL/$(basename "$u")" ;; esac; done; }
+cmd_patch(){ cmd_extract "$1"; find_srcdir; LOGFILE="$LOGDIR/${PKGID}-patch.log"; apply_patches; }
 
-# Set maximum number of threads to use. By default, this will be the number
-# of CPU threads:
-THREADS="$(nproc)"
+# Resolve e instala dependências recursivamente
+install_deps(){ # requer load_rc já feito
+  for dep in $DEPS; do depname="$dep"; depfile=$(find_recipe "$depname" 2>/dev/null || true) || true
+    if [ -n "$depfile" ]; then if ! is_installed "$(. "$depfile"; echo "$PKG-$VER")"; then log "dep: $depname"; cmd_install "$depname" || die "falha dep $depname"; else ok "dep já instalada: $depname"; fi
+    else warn "dep informativa (sem receita): $depname"; fi
+  done
+}
 
-# Set default compression option.
-COMPRESS_OPTION="-9"
+cmd_build(){ mkpaths; load_rc "$1"; LOGFILE="$LOGDIR/${PKGID}-build.log"; cmd_patch "$1" >/dev/null 2>&1 || true; find_srcdir
+  # Configurar
+  if [ -n "${CONFIGURE}" ]; then spinner "configure" "(cd '$SRCDIR' && sh -c \"$CONFIGURE\")"; fi
+  # Compilar
+  if [ -n "${MAKE}" ]; then spinner "make" "(cd '$SRCDIR' && sh -c \"$MAKE\")"; fi
+  # Instala em DESTDIR (fakeroot)
+  rm -rf "$DESTDIR"; mkdir -p "$DESTDIR"
+  if [ -n "${MAKE_INSTALL}" ]; then if command -v fakeroot >/dev/null 2>&1; then spinner "make install (fakeroot)" "(cd '$SRCDIR' && fakeroot sh -c \"$MAKE_INSTALL\")"; else spinner "make install" "(cd '$SRCDIR' && sh -c \"$MAKE_INSTALL\")"; fi; fi
+  # Empacota
+  pkgfile="$PKGDIR/${PKG}-${VER}.tar.${PKGCOMP}"
+  case "$PKGCOMP" in gz) (cd "$DESTDIR" && tar -czf "$pkgfile" .);; xz) (cd "$DESTDIR" && tar -cJf "$pkgfile" .);; zst) (cd "$DESTDIR" && tar --zstd -cpf "$pkgfile" .);; *) (cd "$DESTDIR" && tar -czf "$pkgfile" .);; esac
+  ok "pacote: $pkgfile"
+}
 
-# Parse options
-unset ACLS XATTRS
-while [ 0 ]; do
-  if [ "$1" = "--linkadd" -o "$1" = "-l" ]; then
-    if [ "$2" = "y" ]; then
-      LINKADD=y
-    elif [ "$2" = "n" ]; then
-      LINKADD=n
-    else
-      usage
-      exit 2
-    fi
-    shift 2
-  elif [ "$1" = "--chown" -o "$1" = "-c" ]; then
-    if [ "$2" = "y" ]; then
-      CHOWN=y
-    elif [ "$2" = "n" ]; then
-      CHOWN=n
-    else
-      usage
-      exit 2
-    fi
-    shift 2
-  elif [ "$1" = "-p" -o "$1" = "--prepend" ]; then
-    PREPEND=y
-    shift 1
-  elif [ "$1" = "-threads" -o "$1" = "--threads" ]; then
-    THREADS="$2"
-    shift 2
-    XZ_THREADS_FORCED=yes
-  elif [ "$1" = "-compress" -o "$1" = "--compress" ]; then
-    COMPRESS_OPTION="$2"
-    shift 2
-  elif [ "$1" = "--acls" ]; then
-    ACLS="--acls"
-    shift 1
-  elif [ "$1" = "--xattrs" ]; then
-    XATTRS="--xattrs"
-    shift 1 
-  elif [ "$1" = "--remove-tmp-rpaths" ]; then
-    REMOVE_TMP_RPATHS="true"
-    shift 1 
-  elif [ "$1" = "--remove-rpaths" ]; then
-    REMOVE_RPATHS="true"
-    shift 1 
-  elif [ "$1" = "-h" -o "$1" = "-H" -o "$1" = "--help" -o $# = 0 ]; then
-    usage
-    exit 0
-  else
-    break
-  fi
-done
+install_to_root(){ [ -d "$DESTDIR" ] || die "DESTDIR vazio"; log "instalando em $ROOT"; (cd "$DESTDIR" && tar -cpf - .) | (cd "$ROOT" && tar -xpf -) }
 
-unset MTIME
-if [ -n "${SOURCE_DATE_EPOCH}" ]; then
-  MTIME="--clamp-mtime --mtime=@${SOURCE_DATE_EPOCH}"
-fi
+write_manifest(){ instdir="$VARDB/installed/${PKGID}"; mkdir -p "$instdir"; manifest="$instdir/manifest.txt"
+  # fallback baseado no DESTDIR
+  (cd "$DESTDIR" && find . -type f -o -type l -o -type d | sed 's#^\./##' | sort) > "$manifest"
+  cp "$RCFILE" "$instdir/recipe.rc" 2>/dev/null || true
+  echo "PKG=$PKG\nVER=$VER\nTIME=$(stamp)" > "$instdir/meta"
+}
 
-# Se o argumento for uma receita (arquivo .recipe), baixar e preparar
-if [[ "$1" == *.recipe ]]; then
-    RECIPE="$1"
-    if [[ ! -f "$RECIPE" ]]; then
-        echo "Recipe file not found: $RECIPE"
-        exit 1
-    fi
+post_install_root(){ [ -z "${POST_INSTALL}" ] && return 0; log "POST_INSTALL"; ( cd "$ROOT" && sh -c "$POST_INSTALL" ) || true }
 
-    SOURCE_URL=$(grep '^SOURCE=' "$RECIPE" | cut -d'=' -f2-)
-    NAME=$(grep '^NAME=' "$RECIPE" | cut -d'=' -f2-)
-    VERSION=$(grep '^VERSION=' "$RECIPE" | cut -d'=' -f2-)
+cmd_install(){ FORCE=0; for a in "$@"; do [ "$a" = "--force" ] && FORCE=1; done
+  name="$(printf '%s\n' "$1" | sed 's/--force$//')"; mkpaths; load_rc "$name"
+  if is_installed "$PKGID" && [ $FORCE -ne 1 ]; then ok "$PKGID já instalado"; return 0; fi
+  LOGFILE="$LOGDIR/${PKGID}.log"
+  install_deps
+  cmd_build "$name"
+  install_to_root
+  post_install_root
+  write_manifest "$name"
+  mark_installed
+  ok "instalado: $PKGID"
+}
 
-    if [[ -z "$SOURCE_URL" || -z "$NAME" || -z "$VERSION" ]]; then
-        echo "Recipe missing NAME, VERSION or SOURCE"
-        exit 1
-    fi
+cmd_remove(){ name="$1"; case "$name" in *-*) pkgid="$name";; *)
+  # mapear nome simples para pkgid instalado (se houver 1 match)
+  m=$(ls -1 "$VARDB/installed" 2>/dev/null | grep -E "^${name}-" || true)
+  [ -n "$m" ] || die "não instalado: $name"; cnt=$(printf "%s\n" "$m" | wc -l | tr -d ' '); [ "$cnt" -eq 1 ] || die "múltiplas versões instaladas para $name; especifique <nome>-<ver>"; pkgid="$m";; esac
+  instdir="$VARDB/installed/$pkgid"; [ -d "$instdir" ] || die "não instalado: $pkgid"
+  manifest="$instdir/manifest.txt"; [ -f "$manifest" ] || die "manifesto ausente"
+  log "removendo $pkgid"
+  # remover arquivos listados
+  awk '{print length, $0}' "$manifest" | sort -rn | cut -d' ' -f2- | while IFS= read -r f; do [ -z "$f" ] && continue; p="$ROOT/$f"; [ -L "$p" ] && rm -f "$p" 2>/dev/null || true; [ -f "$p" ] && rm -f "$p" 2>/dev/null || true; [ -d "$p" ] && rmdir "$p" 2>/dev/null || rm -rf "$p" 2>/dev/null || true; done
+  # comandos extras de remoção
+  RCEX="$instdir/recipe.rc"; if [ -f "$RCEX" ]; then set -a; . "$RCEX"; set +a; if [ -n "${REMOVE_CMDS:-}" ]; then log "REMOVE_CMDS"; ( cd "$ROOT" && sh -c "$REMOVE_CMDS" ) || true; fi; fi
+  rm -rf "$instdir"; ok "removido: $pkgid"
+}
 
-    FILENAME=$(basename "$SOURCE_URL")
-    WORK_DIR="$WORK/${NAME}-${VERSION}"
-    mkdir -p "$WORK_DIR"
+cmd_list(){ [ -d "$VARDB/installed" ] || { echo "(vazio)"; return 0; }; ls -1 "$VARDB/installed" | sort; }
+cmd_info(){ name="$1"; dir="$VARDB/installed/$name"; [ -d "$dir" ] || die "não instalado: $name"; [ -f "$dir/meta" ] && cat "$dir/meta"; echo "--- receita ---"; sed -n '1,200p' "$dir/recipe.rc"; }
 
-    echo "Downloading source $SOURCE_URL..."
-    curl -L -o "$WORK/$FILENAME" "$SOURCE_URL"
+cmd_update(){ [ -d "$REPO/.git" ] || die "REPO não é git: $REPO"; (cd "$REPO" && git pull --ff-only); ok "repo atualizado"; }
 
-    echo "Extracting source..."
-    case "$FILENAME" in
-        *.tar.gz|*.tgz) tar -xzf "$WORK/$FILENAME" -C "$WORK_DIR" --strip-components=1 ;;
-        *.tar.bz2|*.tbz2) tar -xjf "$WORK/$FILENAME" -C "$WORK_DIR" --strip-components=1 ;;
-        *.tar.xz|*.txz) tar -xJf "$WORK/$FILENAME" -C "$WORK_DIR" --strip-components=1 ;;
-        *.zip) unzip -q "$WORK/$FILENAME" -d "$WORK_DIR" ;;
-        *) echo "Unsupported archive format"; exit 1 ;;
-    esac
+# Preparação (sem compilar): fetch+extract+patch+deps
+cmd_prepare(){ mkpaths; load_rc "$1"; install_deps; cmd_patch "$1"; ok "pronto: fontes extraídas e patch aplicados"; }
 
-    # Aplica patches
-    PATCH_DIR="$(dirname "$RECIPE")/patches"
-    if [[ -d "$PATCH_DIR" ]]; then
-        echo "Applying patches..."
-        for patch in "$PATCH_DIR"/*.patch; do
-            [[ -f "$patch" ]] || continue
-            echo "  Applying $patch"
-            patch -d "$WORK_DIR" -p1 < "$patch"
-        done
-    fi
+# Imprime árvore de dependências
+cmd_graph(){ load_rc "$1"; printf "%s\n" "$PKG"; _graph_visit "$PKG" "  "; }
+_graph_visit(){ pkg="$1"; indent="$2"; rc=$(find_recipe "$pkg" 2>/dev/null || true) || true; [ -n "$rc" ] || return 0; set -a; . "$rc"; set +a; for d in $DEPS; do printf "%s%s\n" "$indent" "$d"; _graph_visit "$d" "  $indent"; done }
 
-    # Cria slack-desc
-    mkdir -p "$WORK_DIR/install"
-    cat > "$WORK_DIR/install/slack-desc" <<EOF
-$NAME: $NAME package version $VERSION
-EOF
+# Rebuild do sistema: ordena por dependências e recompila/instala
+cmd_rebuild(){ FORCE=0; [ "${1:-}" = "--force" ] && FORCE=1
+  # lista todas receitas; faz ordenação topológica via DFS
+  pkgs=$(find "$RECIPES_DIR" -maxdepth 2 -type f -name '*.rc' -printf '%f\n' 2>/dev/null | sed 's/\.rc$//' | sort)
+  order=""; visited=""; visiting=""
+  topo_visit(){ n="$1"; case " $visited " in *" $n "*) return;; esac; case " $visiting " in *" $n "*) die "ciclo de dependências em $n";; esac
+    visiting="$visiting $n"; rc=$(find_recipe "$n" 2>/dev/null || true) || true; if [ -n "$rc" ]; then set -a; . "$rc"; set +a; for d in $DEPS; do topo_visit "$d"; done; fi; visiting=$(printf '%s' "$visiting" | sed "s/ $n//"); visited="$visited $n"; order="$order $n"; }
+  for p in $pkgs; do topo_visit "$p"; done
+  for p in $order; do if [ $FORCE -eq 1 ]; then cmd_install "$p" --force; else is_installed "$(load_rc "$p"; echo "$PKG-$VER")" && ok "skip $p" || cmd_install "$p"; fi; done
+  ok "rebuild concluído"
+}
 
-    # Definindo PACKAGE_NAME como destino final
-    PACKAGE_NAME="$BIN/${NAME}-${VERSION}.tgz"
-    cd "$WORK_DIR"
-fi
-
-PACKAGE_NAME="$1"
-TARGET_NAME="$(dirname $PACKAGE_NAME)"
-PACKAGE_NAME="$(basename $PACKAGE_NAME)"
-
-# Identify package extension and compression type to use:
-if [ ! "$(basename $PACKAGE_NAME .tgz)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tgz"
-  COMPEXT="gz"
-  COMPRESSOR="gzip ${COMPRESS_OPTION} -cn"
-  if ! which gzip 1> /dev/null 2> /dev/null ; then
-    echo "ERROR:  gzip compression utility not found in \$PATH."
-    exit 3
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .tar.gz)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tar.gz"
-  COMPRESSOR="gzip ${COMPRESS_OPTION} -cn"
-  if ! which gzip 1> /dev/null 2> /dev/null ; then
-    echo "ERROR:  gzip compression utility not found in \$PATH."
-    exit 3
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .tbz)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tbz"
-  if which lbzip2 1> /dev/null 2> /dev/null ; then
-    COMPRESSOR="lbzip2 ${COMPRESS_OPTION} -c"
-  else
-    if which bzip2 1> /dev/null 2> /dev/null ; then
-      COMPRESSOR="bzip2 ${COMPRESS_OPTION} -c"
-    else
-      echo "ERROR:  bzip2 compression utility not found in \$PATH."
-      exit 3
-    fi
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .tar.bz2)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tar.bz2"
-  if which lbzip2 1> /dev/null 2> /dev/null ; then
-    COMPRESSOR="lbzip2 ${COMPRESS_OPTION} -c"
-  else
-    if which bzip2 1> /dev/null 2> /dev/null ; then
-      COMPRESSOR="bzip2 ${COMPRESS_OPTION} -c"
-    else
-      echo "ERROR:  bzip2 compression utility not found in \$PATH."
-      exit 3
-    fi
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .tlz)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tlz"
-  if which plzip 1> /dev/null 2> /dev/null ; then
-    COMPRESSOR="plzip ${COMPRESS_OPTION} --threads=${THREADS} -c"
-  else
-    echo "WARNING:  plzip compression utility not found in \$PATH."
-    echo "WARNING:  package will not support multithreaded decompression."
-    if which lzip 1> /dev/null 2> /dev/null ; then
-      COMPRESSOR="lzip ${COMPRESS_OPTION} -c"
-    else
-      echo "ERROR:  lzip compression utility not found in \$PATH."
-      exit 3
-    fi
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .tar.lz)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tar.lz"
-  if which plzip 1> /dev/null 2> /dev/null ; then
-    COMPRESSOR="plzip ${COMPRESS_OPTION} --threads=${THREADS} -c"
-  else
-    echo "WARNING:  plzip compression utility not found in \$PATH."
-    echo "WARNING:  package will not support multithreaded decompression."
-    if which lzip 1> /dev/null 2> /dev/null ; then
-      COMPRESSOR="lzip ${COMPRESS_OPTION} -c"
-    else
-      echo "ERROR:  lzip compression utility not found in \$PATH."
-      exit 3
-    fi
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .tar.lzma)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tar.lzma"
-  COMPRESSOR="lzma ${COMPRESS_OPTION} -c"
-  if ! which lzma 1> /dev/null 2> /dev/null ; then
-    echo "ERROR:  lzma compression utility not found in \$PATH."
-    exit 3
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .txz)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="txz"
-  if [ ! "$XZ_THREADS_FORCED" = "yes" ]; then
-    if [[ "$(uname -m)" =~ (x86_64|aarch64|riscv64) ]]; then
-      # Allow xz to determine how many threads to use:
-      COMPRESSOR="xz ${COMPRESS_OPTION} --threads=0 -c"
-    else
-      # Default to 2 threads on 32-bit platforms:
-      COMPRESSOR="xz ${COMPRESS_OPTION} --threads=2 -c"
-    fi
-  else
-    COMPRESSOR="xz ${COMPRESS_OPTION} --threads=${THREADS} -c"
-  fi
-  if ! which xz 1> /dev/null 2> /dev/null ; then
-    echo "ERROR:  xz compression utility not found in \$PATH."
-    exit 3
-  fi
-elif [ ! "$(basename $PACKAGE_NAME .tar.xz)" = "$PACKAGE_NAME" ]; then
-  EXTENSION="tar.xz"
-  if [ ! "$XZ_THREADS_FORCED" = "yes" ]; then
-    if [[ "$(uname -m)" =~ (x86_64|aarch64|riscv64) ]]; then
-      # Allow xz to determine how many threads to use:
-      COMPRESSOR="xz ${COMPRESS_OPTION} --threads=0 -c"
-    else
-      # Default to 2 threads on 32-bit platforms:
-      COMPRESSOR="xz ${COMPRESS_OPTION} --threads=2 -c"
-    fi
-  else
-    COMPRESSOR="xz ${COMPRESS_OPTION} --threads=${THREADS} -c"
-  fi
-  if ! which xz 1> /dev/null 2> /dev/null ; then
-    echo "ERROR:  xz compression utility not found in \$PATH."
-    exit 3
-  fi
-else
-  EXTENSION="$(echo $PACKAGE_NAME | rev | cut -f 1 -d . | rev)"
-  echo "ERROR:  Package extension .$EXTENSION is not supported."
-  exit 1
-fi
-
-TAR_NAME="$(basename $PACKAGE_NAME .$EXTENSION)"
-
-# Sanity check -- we can't make the package in the current directory:
-if [ "$CWD" = "$TARGET_NAME" -o "." = "$TARGET_NAME" ]; then
-  echo "ERROR: Can't make output package in current directory."
-  exit 2
-fi
-
-echo
-echo "Slackware package maker, version 3.14159265."
-echo
-echo "Searching for symbolic links:"
-# Get rid of possible pre-existing trouble:
-INST=$(mktemp $TMP/makepkg.XXXXXX)
-# Escape some characters in symlink names:
-find . -type l -printf "%p\t%l\n" | LC_COLLATE=C sort | sed 's,^\./,,; s,[ "#$&\x27()*;<>?[\\`{|~],\\&,g;' | tee $INST
-if [ ! "$(cat $INST)" = "" ]; then
-  echo
-  echo "Making symbolic link creation script:"
-  make_install_script $INST | tee doinst.sh
-fi
-echo
-if [ ! "$(cat $INST)" = "" ]; then
-  if [ -r install/doinst.sh ]; then
-    echo "Unless your existing installation script already contains the code"
-    echo "to create these links, you should append these lines to your existing"
-    echo "install script. Now's your chance. :^)"
-    echo
-    echo "Would you like to add this stuff to the existing install script and"
-    echo -n "remove the symbolic links ([y]es, [n]o)? "
-  else
-    echo "It is recommended that you make these lines your new installation script."
-    echo
-    echo "Would you like to make this stuff the install script for this package"
-    echo -n "and remove the symbolic links ([y]es, [n]o)? "
-  fi
-  if [ ! "$LINKADD" ]; then
-    read LINKADD;
-    echo
-  else
-    echo $LINKADD
-    echo
-  fi
-  if [ "$LINKADD" = "y" ]; then
-    if [ -r install/doinst.sh ]; then
-      UPDATE="t"
-      if [ "$PREPEND" = "y" ]; then
-        touch install/doinst.sh
-        mv install/doinst.sh install/doinst.sh.shipped
-        cat doinst.sh > install/doinst.sh
-        echo "" >> install/doinst.sh
-        cat install/doinst.sh.shipped >> install/doinst.sh
-        rm -f install/doinst.sh.shipped
-      else
-        cat doinst.sh >> install/doinst.sh
-      fi
-    else
-      mkdir -p install
-      cat doinst.sh > install/doinst.sh
-    fi
-    echo
-    echo "Removing symbolic links:"
-    find . -type l -exec rm -v {} \;
-    echo
-    if [ "$UPDATE" = "t" ]; then
-      if [ "$PREPEND" = "y" ]; then
-        echo "Updating your ./install/doinst.sh (prepending symlinks)..."
-      else
-        echo "Updating your ./install/doinst.sh..."
-      fi
-    else
-      echo "Creating your new ./install/doinst.sh..."
-    fi
-  fi
-else
-  echo "No symbolic links were found, so we won't make an installation script."
-  echo "You can make your own later in ./install/doinst.sh and rebuild the"
-  echo "package if you like."
-fi
-rm -f doinst.sh $INST
-echo
-echo "This next step is optional - you can set the directories in your package"
-echo "to some sane permissions. If any of the directories in your package have"
-echo "special permissions, then DO NOT reset them here!"
-echo 
-echo "Would you like to reset all directory permissions to 755 (drwxr-xr-x) and"
-echo -n "directory ownerships to root:root ([y]es, [n]o)? "
-if [ ! "$CHOWN" ]; then
-  read CHOWN;
-  echo
-else
-  echo $CHOWN
-  echo
-fi
-if [ "$CHOWN" = "y" ]; then
-  find . -type d -exec chmod -v 755 {} \; 
-  find . -type d -exec chown -v root:root {} \;
-fi
-
-# Ensure that the 'root' of the package is chmod 755 because
-# the / of your filesystem will inherit these permissions.
-# If it's anything tighter than 755 then bad things happen such as users
-# not being able to login, users already logged in can no longer run commands
-# and so on.
-OLDROOTPERMS="$(find -name . -printf "%m\n")"
-if [ $OLDROOTPERMS -ne 755 ]; then
-  echo "WARNING: $PWD is chmod $OLDROOTPERMS"
-  echo "         temporarily changing to chmod 755"
-  chmod 755 .
-fi
-
-# Detect/warn/remove rpaths from ELF objects:
-for ELFOBJ in $(find . -type f | xargs file | grep ' ELF ' | cut -f 1 -d :) ; do
-  if objdump -p "$ELFOBJ" 2>/dev/null | grep -q R.*PATH ; then
-    if [ "$REMOVE_RPATHS" = "true" ]; then
-      echo "Removing rpath from: $ELFOBJ"
-      patchelf --remove-rpath "$ELFOBJ"
-    elif [ "$REMOVE_TMP_RPATHS" = "true" ]; then
-      if objdump -p "$ELFOBJ" 2>/dev/null | grep -q R.*PATH.*/tmp ; then
-        echo "Removing /tmp rpath from: $ELFOBJ"
-        patchelf --remove-rpath "$ELFOBJ"
-      fi
-    else # just warn:
-      if objdump -p "$ELFOBJ" 2>/dev/null | grep -q R.*PATH.*/tmp ; then
-        echo "WARNING: */tmp* rpath found in $ELFOBJ: $(objdump -p "$ELFOBJ" 2>/dev/null | grep R.*PATH)"
-        # This is important, so we'll notify again after the package is built:
-        NOTIFY_INSECURE_RPATH="  WARNING: */tmp* rpath found in $ELFOBJ: $(objdump -p "$ELFOBJ" 2>/dev/null | grep R.*PATH)"
-      else
-        echo "WARNING: rpath found in $ELFOBJ: $(objdump -p "$ELFOBJ" 2>/dev/null | grep R.*PATH)"
-      fi
-    fi
-  fi
-done
-echo
-
-echo "Creating Slackware package:  ${TARGET_NAME}/${TAR_NAME}.${EXTENSION}"
-echo
-rm -f ${TARGET_NAME}/${TAR_NAME}.${EXTENSION}
-
-# HISTORICAL NOTE 2/2018:
-# In the interest of maximizing portability of this script, we'll use find
-# and sed to create a filelist compatible with tar-1.13, and then use a
-# more modern tar version to create the archive.
-#
-# Other (but possibly less portable) ways to achieve the same result:
-#
-# Use the tar --transform and --show-transformed-names options:
-# tar --transform "s,^\./\(.\),\1," --show-transformed-names $ACLS $XATTRS -cvf - . | $COMPRESSOR > ${TARGET_NAME}/${TAR_NAME}.${EXTENSION}
-#
-# Use cpio:
-# find ./ | sed '2,$s,^\./,,' | cpio --quiet -ovHustar > ${TARGET_NAME}/${TAR_NAME}.tar
-
-# Create the package:
-find ./ | LC_COLLATE=C sort | sed '2,$s,^\./,,' | tar --no-recursion $ACLS $XATTRS $MTIME -T - -cvf - | $COMPRESSOR > ${TARGET_NAME}/${TAR_NAME}.${EXTENSION}
-ERRCODE=$?
-if [ ! $ERRCODE = 0 ]; then
-  echo "ERROR:  $COMPRESSOR returned error code $ERRCODE -- makepkg failed."
-  exit 1
-fi
-
-# Warn of zero-length files:
-find . -type f -size 0c | cut -b3- | sed "s/^/WARNING:  zero length file /g"
-
-# Warn of corrupt or empty gzip files:
-find . -type f -name '*.gz' | while read file ; do
-  if ! gzip -t $file 1> /dev/null 2> /dev/null ; then
-    echo "WARNING:  gzip test failed on $(echo $file | cut -b3-)"
-  else
-    if [ "$(gzip -l $file | tail -n 1 | tr -s ' ' | cut -f 3 -d ' ')" -eq 0 ]; then
-      echo "WARNING:  $(echo $file | cut -b3-) is an empty gzipped file"
-    fi
-  fi
-done
-
-# Some more handy warnings:
-if [ -d usr/share/man ]; then
-  echo "WARNING:  /usr/share/man (with possibly not gzipped man pages) detected"
-fi
-
-if [ -d usr/share/info ]; then
-  echo "WARNING:  /usr/share/info (with possibly not gzipped info pages) detected"
-fi
-
-if find . | grep site_perl 1> /dev/null ; then
-  echo "WARNING:  site_perl directory detected (this is fine for a local package build)"
-fi
-
-# Restore the old permissions if they previously weren't chmod 755
-if [ $OLDROOTPERMS -ne 755 ]; then
-  echo
-  echo "Restoring permissions of $PWD to chmod $OLDROOTPERMS"
-  chmod $OLDROOTPERMS .
-fi
-
-echo
-echo "Slackware package ${TARGET_NAME}/${TAR_NAME}.${EXTENSION} created."
-if [ ! -z "$NOTIFY_INSECURE_RPATH" ]; then
-  echo "WARNING: detected at least one insecure /tmp rpath:"
-  echo $NOTIFY_INSECURE_RPATH
-fi
-echo
+################################ Dispatcher ###################################
+[ $# -ge 1 ] || { echo "uso: $0 <comando> [args]"; exit 1; }
+case "$1" in
+  install)  shift; [ $# -ge 1 ] || die "uso: install <nome|arquivo.rc> [--force]"; cmd_install "$@" ;;
+  build)    shift; [ $# -ge 1 ] || die "uso: build <nome|arquivo.rc>"; cmd_build "$1" ;;
+  fetch)    shift; [ $# -ge 1 ] || die "uso: fetch <nome|arquivo.rc>"; cmd_fetch "$1" ;;
+  extract)  shift; [ $# -ge 1 ] || die "uso: extract <nome|arquivo.rc>"; cmd_extract "$1" ;;
+  patch)    shift; [ $# -ge 1 ] || die "uso: patch <nome|arquivo.rc>"; cmd_patch "$1" ;;
+  deps)     shift; [ $# -ge 1 ] || die "uso: deps <nome|arquivo.rc>"; load_rc "$1"; install_deps ;;
+  remove)   shift; [ $# -ge 1 ] || die "uso: remove <nome[-ver]>"; cmd_remove "$1" ;;
+  list)     cmd_list ;;
+  info)     shift; [ $# -ge 1 ] || die "uso: info <nome[-ver]>"; cmd_info "$1" ;;
+  update)   cmd_update ;;
+  rebuild)  shift; cmd_rebuild "${1:-}" ;;
+  graph)    shift; [ $# -ge 1 ] || die "uso: graph <nome>"; cmd_graph "$1" ;;
+  prepare)  shift; [ $# -ge 1 ] || die "uso: prepare <nome>"; cmd_prepare "$1" ;;
+  *) die "comando desconhecido: $1" ;;
+ esac
