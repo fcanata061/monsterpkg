@@ -1,0 +1,658 @@
+#!/bin/sh
+# ============================================================================
+# srcmgr — gerenciador source-based minimalista (POSIX sh) — v2 (deps+rollback)
+# ============================================================================
+
+set -eu
+
+# ----------------------------- Defaults -------------------------------------
+: "${ROOT:=/}"
+: "${REPO:=${PWD}}"
+: "${RECIPES_DIR:=${REPO}/repo}"      # raiz clássica
+: "${WORK:=${PWD}/work}"
+: "${DL:=${PWD}/distfiles}"
+: "${DESTDIR:=${PWD}/dest}"
+: "${PKGDIR:=${PWD}/packages}"
+: "${VARDB:=/var/lib/srcmgr}"
+: "${LOGDIR:=${PWD}/logs}"
+: "${JOBS:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+: "${PKGCOMP:=gz}"                     # gz|xz|zst
+: "${USE_COLOR:=1}"
+: "${USE_SPINNER:=1}"
+
+umask 022
+
+# --------------------------- Config files ------------------------------------
+load_config() {
+  # /etc/srcmgr.conf
+  [ -f /etc/srcmgr.conf ] && . /etc/srcmgr.conf
+  # ~/.config/srcmgr.conf ou ~/.srcmgr.conf
+  if [ -f "$HOME/.config/srcmgr.conf" ]; then . "$HOME/.config/srcmgr.conf"; fi
+  if [ -f "$HOME/.srcmgr.conf" ]; then . "$HOME/.srcmgr.conf"; fi
+
+  # repos.d: arquivos .repo com caminhos de receitas (um caminho por linha)
+  REPO_PATHS="$RECIPES_DIR"
+  if [ -d /etc/srcmgr/repos.d ]; then
+    for f in /etc/srcmgr/repos.d/*.repo; do
+      [ -f "$f" ] || continue
+      while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        case "$line" in \#*) continue;; esac
+        [ -d "$line" ] && REPO_PATHS="$REPO_PATHS:$line"
+      done < "$f"
+    done
+  fi
+  export REPO_PATHS
+}
+load_config
+
+# ------------------------------ UI ------------------------------------------
+if [ -t 2 ] && [ "$USE_COLOR" -eq 1 ]; then
+  C_RESET="$(printf '\033[0m')"
+  C_BOLD="$(printf '\033[1m')"
+  C_DIM="$(printf '\033[2m')"
+  C_RED="$(printf '\033[31m')"
+  C_GRN="$(printf '\033[32m')"
+  C_YEL="$(printf '\033[33m')"
+  C_CYN="$(printf '\033[36m')"
+else
+  C_RESET=; C_BOLD=; C_DIM=; C_RED=; C_GRN=; C_YEL=; C_CYN=
+fi
+
+ts(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
+ts_short(){ date -u +'%Y%m%d-%H%M%S'; }
+log(){ printf '%s%s[*]%s %s\n' "$C_CYN" "$C_BOLD" "$C_RESET" "$*" >&2; }
+ok(){  printf '%s%s[OK]%s %s\n' "$C_GRN" "$C_BOLD" "$C_RESET" "$*" >&2; }
+warn(){printf '%s[!]%s %s\n' "$C_YEL" "$C_RESET" "$*" >&2; }
+die(){ printf '%s%s[x]%s %s\n' "$C_RED" "$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
+
+spinner() {
+  if [ "$USE_SPINNER" -ne 1 ] || [ ! -t 2 ]; then shift; sh -c "$*"; return $?; fi
+  msg=$1; shift
+  (
+    sh -c "$*"
+  ) &
+  pid=$!
+  i=0; chars='|/-\'
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i+1) % 4 ))
+    printf '\r%s%s %s%s' "$C_DIM" "$msg" "$(printf '%s' "$chars" | cut -c $((i+1)))" "$C_RESET" >&2
+    sleep 0.1
+  done
+  wait "$pid"; rc=$?
+  printf '\r%*s\r' $(( ${#msg} + 2 )) '' >&2
+  [ $rc -eq 0 ] && ok "$msg" || die "$msg falhou"
+  return $rc
+}
+
+runlog(){
+  if [ -n "${LOGFILE:-}" ]; then
+    ( sh -c "$*" ) 2>&1 | tee -a "$LOGFILE"
+  else
+    sh -c "$*"
+  fi
+}
+
+need(){ command -v "$1" >/dev/null 2>&1 || die "comando requerido ausente: $1"; }
+mkpaths(){ mkdir -p "$WORK" "$DL" "$DESTDIR" "$PKGDIR" "$VARDB/installed" "$LOGROOT" "$RECIPES_DIR"; }
+sha256tool(){ command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo "shasum -a 256"; }
+file_from_url(){ b=$(basename "$1"); printf '%s\n' "$b" | sed 's/[?].*$//'; }
+
+# ------------------------- Busca de receitas ---------------------------------
+split_paths() { printf '%s' "$1" | tr ':' '\n'; }
+
+find_recipe(){
+  name=$1
+  case "$name" in *.rc) base="$name";; *) base="$name.rc";; esac
+
+  # caminho direto?
+  if [ -f "$name" ]; then echo "$name"; return 0; fi
+
+  for p in $(split_paths "$REPO_PATHS"); do
+    [ -d "$p" ] || continue
+    [ -f "$p/$base" ] && { echo "$p/$base"; return 0; }
+    f=$(find "$p" -maxdepth 3 -type f -name "$base" 2>/dev/null | head -n1 || true)
+    [ -n "$f" ] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+cmd_search(){
+  q=$1
+  out=""
+  for p in $(split_paths "$REPO_PATHS"); do
+    [ -d "$p" ] || continue
+    r=$(find "$p" -type f -name '*.rc' -printf '%f\n' 2>/dev/null | sed 's/\.rc$//' | grep -i -- "$q" || true)
+    [ -n "$r" ] && out="$out$r\n"
+  done
+  [ -n "$out" ] && printf "%b" "$out" | sort -u || echo "(nada encontrado)"
+}
+
+# ------------------------- Carregar receita ----------------------------------
+load_rc(){
+  RCFILE=$(find_recipe "$1") || die "receita não encontrada: $1 (repos: $REPO_PATHS)"
+  RECDIR=$(CDPATH= cd -- "$(dirname -- "$RCFILE")" && pwd)
+  # shellcheck disable=SC1090
+  set -a; . "$RCFILE"; set +a
+
+  PKG="${PKG:-${pkgname:-}}"
+  VER="${VER:-${pkgver:-}}"
+  SRC="${SRC:-${url:-}}"
+  SHA256="${SHA256:-${sha256:-}}"
+  SHA256_FILES="${SHA256_FILES:-${sha256_files:-}}"
+  PATCHES="${PATCHES:-${patches:-${PATCHES_LIST:-}}}"
+  DEPS="${DEPS:-${deps:-}}"
+  CONFIGURE="${CONFIGURE:-${configure:-}}"
+  MAKE="${MAKE:-${make:-}}"
+  MAKE_INSTALL="${MAKE_INSTALL:-${install:-}}"
+  POST_INSTALL="${POST_INSTALL:-${post_install:-}}"
+  REMOVE_CMDS="${REMOVE_CMDS:-${remove:-}}"
+  BUILD_DIR="${BUILD_DIR:-${builddir:-${workdir:-}}}"
+  PREFIX="${PREFIX:-/usr}"
+
+  : "${PKG:?defina PKG na receita}"
+  : "${VER:?defina VER na receita}"
+  : "${SRC:?defina SRC na receita}"
+
+  PKGID="${PKG}-${VER}"
+
+  # logging raiz deste pacote/execução
+  RUNID=$(ts_short)
+  LOGROOT="$LOGDIR/$PKGID"
+  mkdir -p "$LOGROOT"
+  LOGFILE="$LOGROOT/${RUNID}-stage.log"
+}
+
+# --------------------------- FETCH/VERIFY/EXTRACT/PATCH ----------------------
+fetch_one(){
+  u=$1
+  case "$u" in
+    git+http://*|git+https://*|git+ssh://*|*.git)
+      need git
+      url=$(printf '%s' "$u" | sed 's#^git\+##')
+      name=$(basename "$url" .git)
+      tgt="$WORK/${name}.git"
+      if [ -d "$tgt" ]; then
+        log "git fetch: $url"
+        (cd "$tgt" && git fetch --all --tags --prune)
+      else
+        spinner "git clone --mirror $name" "git clone --mirror '$url' '$tgt'"
+      fi
+      ;;
+    http://*|https://*|ftp://*)
+      out="$DL/$(file_from_url "$u")"
+      if [ -f "$out" ]; then
+        ok "já baixado: $(basename "$out")"
+      else
+        if command -v curl >/dev/null 2>&1; then
+          spinner "baixando $(basename "$out")" "curl -fL --retry 3 -o '$out' '$u'"
+        else
+          need wget
+          spinner "baixando (wget) $(basename "$out")" "wget -O '$out' '$u'"
+        fi
+      fi
+      ;;
+    /*|./*|../*)
+      cp -n "$u" "$DL/" 2>/dev/null || true
+      ;;
+    *)
+      die "SRC desconhecido: $u"
+      ;;
+  esac
+}
+
+verify_sha(){
+  s256=$(sha256tool)
+  [ -z "${SHA256:-}${SHA256_FILES:-}" ] && { warn "sem SHA256 definido"; return 0; }
+  if [ -n "${SHA256:-}" ]; then
+    first=$(printf '%s\n' $SRC | awk 'NF{print; exit}')
+    f=$(file_from_url "$first")
+    (cd "$DL" && echo "$SHA256  $f" | $s256 -c -) || die "SHA256 falhou: $f"
+    ok "SHA256 OK: $f"
+  fi
+  if [ -n "${SHA256_FILES:-}" ]; then
+    echo "$SHA256_FILES" | while IFS= read -r ln; do
+      [ -z "$ln" ] && continue
+      f=$(printf '%s' "$ln" | cut -d= -f1)
+      h=$(printf '%s' "$ln" | cut -d= -f2-)
+      (cd "$DL" && echo "$h  $f" | $s256 -c -) || die "SHA256 falhou: $f"
+      ok "SHA256 OK: $f"
+    done
+  fi
+}
+
+extract_one(){
+  s=$1
+  case "$s" in
+    *.git)
+      need git
+      name=$(basename "$s" .git)
+      out="$WORK/src/$PKGID-$name"
+      mkdir -p "$WORK/src"
+      if [ -d "$out/.git" ]; then
+        log "git update $name"
+        (cd "$out" && git fetch && (git rev-parse --verify origin/HEAD >/dev/null 2>&1 && git reset --hard origin/HEAD) || true)
+      else
+        spinner "git clone $name" "git clone '$s' '$out'"
+      fi
+      ;;
+    *.tar.gz|*.tgz)   mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar -xzf '$s' -C '$WORK/src'";;
+    *.tar.bz2|*.tbz2) mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar -xjf '$s' -C '$WORK/src'";;
+    *.tar.xz|*.txz)   mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar -xJf '$s' -C '$WORK/src'";;
+    *.tar.zst|*.tzst) mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "tar --zstd -xpf '$s' -C '$WORK/src'";;
+    *.zip)            mkdir -p "$WORK/src"; spinner "extraindo $(basename "$s")" "(cd '$WORK/src' && unzip -q '$s')";;
+    *) warn "ignorado (formato?): $(basename "$s")";;
+  esac
+}
+
+find_srcdir(){
+  if [ -n "${BUILD_DIR:-}" ] && [ -d "$BUILD_DIR" ]; then SRCDIR="$BUILD_DIR"; return; fi
+  guess="$WORK/src/${PKG}-${VER}"
+  if [ -d "$guess" ]; then SRCDIR="$guess"; return; fi
+  d=$(find "$WORK/src" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1 || true)
+  [ -n "$d" ] || die "SRCDIR não encontrado (defina BUILD_DIR na receita)"
+  SRCDIR="$d"
+}
+
+apply_patches(){
+  need patch
+  # 1) patches declarados em PATCHES (lista)
+  for p in ${PATCHES:-}; do
+    case "$p" in /*) patchfile="$p";; *) patchfile="$RECDIR/$p";; esac
+    [ -f "$patchfile" ] || die "patch não encontrado: $p"
+    log "patch: $(basename "$patchfile")"
+    (cd "$SRCDIR" && patch -p1 < "$patchfile")
+  done
+  # 2) diretório repo/patches/<pkgid|pkg>/*.patch
+  for dir in "$RECDIR/../patches/$PKGID" "$RECDIR/../patches/$PKG"; do
+    [ -d "$dir" ] || continue
+    for pf in $(ls "$dir"/*.patch 2>/dev/null | sort); do
+      log "patch (auto): $(basename "$pf")"
+      (cd "$SRCDIR" && patch -p1 < "$pf")
+    done
+  done
+}
+
+cmd_fetch(){ mkpaths; load_rc "$1"; LOGFILE="$LOGROOT/${RUNID}-fetch.log"; for u in $SRC; do fetch_one "$u"; done; verify_sha; }
+cmd_extract(){
+  mkpaths; load_rc "$1"
+  LOGFILE="$LOGROOT/${RUNID}-extract.log"
+  # garante fetch + verify
+  for u in $SRC; do fetch_one "$u"; done; verify_sha
+  for u in $SRC; do
+    case "$u" in
+      *.git|git+*) extract_one "$(printf '%s' "$u" | sed 's#^git\+##')" ;;
+      http*|ftp*)  extract_one "$DL/$(file_from_url "$u")" ;;
+      /*|./*|../*) extract_one "$DL/$(basename "$u")" ;;
+    esac
+  done
+}
+cmd_patch(){ cmd_extract "$1" >/dev/null 2>&1 || true; find_srcdir; LOGFILE="$LOGROOT/${RUNID}-patch.log"; apply_patches; }
+
+# ---------------------------- Dependências -----------------------------------
+# Resolve deps com ordenação topológica e detecção de ciclos
+resolve_deps_order(){
+  target="$1"
+  VISITED=""
+  TEMP=""
+  ORDER=""
+
+  topo_visit(){
+    n="$1"
+    case " $VISITED " in *" $n "*) return ;; esac
+    case " $TEMP " in *" $n "*) die "ciclo de dependências detectado em: $n" ;; esac
+    TEMP="$TEMP $n"
+    rc=$(find_recipe "$n" 2>/dev/null || true) || true
+    if [ -n "$rc" ]; then
+      set -a; . "$rc"; set +a
+      deps_local="${DEPS:-${deps:-}}"
+      for d in $deps_local; do topo_visit "$d"; done
+    fi
+    TEMP=$(printf '%s' "$TEMP" | sed "s/ $n//")
+    VISITED="$VISITED $n"
+    ORDER="$ORDER $n"
+  }
+
+  topo_visit "$target"
+  # remove duplicados mantendo ordem
+  uniq_order=""
+  for x in $ORDER; do
+    case " $uniq_order " in *" $x "*) : ;; *) uniq_order="$uniq_order $x";; esac
+  done
+  # imprime sem o alvo? não: manter todos, quem chama decide
+  printf '%s\n' "$uniq_order" | awk 'NF'
+}
+
+install_deps_resolved(){
+  order=$(resolve_deps_order "$1")
+  for dep in $order; do
+    rc=$(find_recipe "$dep" 2>/dev/null || true) || true
+    [ -n "$rc" ] || { warn "dep informativa (sem receita): $dep"; continue; }
+    set -a; . "$rc"; set +a
+    DPKG="${PKG:-${pkgname:-$dep}}"
+    DVER="${VER:-${pkgver:-0}}"
+    DPKGID="$DPKG-$DVER"
+    if is_installed "$DPKGID"; then ok "dep já instalada: $DPKGID"; else cmd_install "$dep"; fi
+  done
+}
+
+# ---------------------------- BUILD / INSTALL --------------------------------
+cmd_build(){
+  mkpaths; load_rc "$1"
+  LOGFILE="$LOGROOT/${RUNID}-build.log"
+
+  # preparar fontes + patches
+  cmd_patch "$1" >/dev/null 2>&1 || true
+  find_srcdir
+
+  # configure
+  if [ -n "${CONFIGURE:-}" ]; then
+    spinner "configure ($PKGID)" "(cd '$SRCDIR' && sh -c \"PREFIX='$PREFIX' JOBS='$JOBS' DESTDIR='$DESTDIR' $CONFIGURE\")"
+  fi
+  # build
+  if [ -n "${MAKE:-}" ]; then
+    spinner "make ($PKGID)" "(cd '$SRCDIR' && sh -c \"PREFIX='$PREFIX' JOBS='$JOBS' DESTDIR='$DESTDIR' $MAKE\")"
+  fi
+
+  # limpar DESTDIR e instalar na imagem
+  rm -rf "$DESTDIR"; mkdir -p "$DESTDIR"
+  if [ -n "${MAKE_INSTALL:-}" ]; then
+    if command -v fakeroot >/dev/null 2>&1; then
+      spinner "make install (fakeroot)" "(cd '$SRCDIR' && fakeroot sh -c \"PREFIX='$PREFIX' JOBS='$JOBS' DESTDIR='$DESTDIR' $MAKE_INSTALL\")"
+    else
+      spinner "make install" "(cd '$SRCDIR' && sh -c \"PREFIX='$PREFIX' JOBS='$JOBS' DESTDIR='$DESTDIR' $MAKE_INSTALL\")"
+    fi
+  fi
+
+  # empacotar DESTDIR
+  mkdir -p "$PKGDIR"
+  PKGARCHIVE="$PKGDIR/${PKG}-${VER}.tar.${PKGCOMP}"
+  case "$PKGCOMP" in
+    gz) (cd "$DESTDIR" && tar -czf "$PKGARCHIVE" .) ;;
+    xz) (cd "$DESTDIR" && tar -cJf "$PKGARCHIVE" .) ;;
+    zst) (cd "$DESTDIR" && tar --zstd -cpf "$PKGARCHIVE" .) ;;
+    *)  (cd "$DESTDIR" && tar -czf "$PKGARCHIVE" .) ;;
+  esac
+  ok "pacote gerado: $PKGARCHIVE"
+}
+
+install_to_root(){
+  [ -d "$DESTDIR" ] || die "DESTDIR vazio (nada a instalar)"
+  log "instalando em $ROOT"
+  (cd "$DESTDIR" && tar -cpf - .) | (cd "$ROOT" && tar -xpf -)
+}
+
+write_manifest_from_destdir(){
+  instdir="$VARDB/installed/${PKGID}"
+  mkdir -p "$instdir"
+  manifest="$instdir/manifest.txt"
+  (cd "$DESTDIR" && find . -mindepth 1 | sed 's#^\./##' | sort) > "$manifest"
+  cp "$RCFILE" "$instdir/recipe.rc" 2>/dev/null || true
+  {
+    echo "PKG=$PKG"
+    echo "VER=$VER"
+    echo "TIME=$(ts)"
+    echo "ARCHIVE=$PKGARCHIVE"
+  } > "$instdir/meta"
+}
+
+post_install_root(){
+  [ -z "${POST_INSTALL:-}" ] && return 0
+  log "POST_INSTALL ($PKGID)"
+  ( cd "$ROOT" && sh -c "$POST_INSTALL" ) || true
+}
+
+mark_installed(){ mkdir -p "$VARDB/installed/${PKGID}"; }
+
+rollback_installed(){
+  # usa manifesto gerado a partir do DESTDIR para remover o que acabou de copiar
+  instdir="$VARDB/installed/${PKGID}"
+  manifest="$instdir/manifest.txt"
+  [ -f "$manifest" ] || { warn "rollback: manifesto ausente (nada a fazer)"; return 0; }
+  log "rollback: removendo arquivos instalados de $PKGID"
+  # remove em ordem de caminhos mais longos primeiro
+  awk '{print length, $0}' "$manifest" | sort -rn | cut -d' ' -f2- |
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    p="$ROOT/$f"
+    if [ -L "$p" ] || [ -f "$p" ]; then rm -f "$p" 2>/dev/null || true
+    elif [ -d "$p" ]; then rmdir "$p" 2>/dev/null || rm -rf "$p" 2>/dev/null || true
+    fi
+  done
+  rm -rf "$instdir"
+}
+
+is_installed(){ [ -d "$VARDB/installed/$1" ]; }
+
+cmd_install(){
+  FORCE=0
+  case "${2:-}" in --force) FORCE=1;; esac
+
+  mkpaths; load_rc "$1"
+  LOGFILE="$LOGROOT/${RUNID}-install.log"
+
+  if is_installed "$PKGID" && [ $FORCE -ne 1 ]; then ok "$PKGID já instalado"; return 0; fi
+
+  # 1) instalar dependências em ordem topológica (sem incluir o próprio pacote)
+  # resolve_deps_order inclui o próprio no final; vamos instalar só deps
+  full_order=$(resolve_deps_order "$PKG")
+  deps_only=""
+  for x in $full_order; do [ "$x" = "$PKG" ] && break; deps_only="$deps_only $x"; done
+  for dep in $deps_only; do
+    rcdep=$(find_recipe "$dep" 2>/dev/null || true) || true
+    [ -n "$rcdep" ] || { warn "dep informativa (sem receita): $dep"; continue; }
+    set -a; . "$rcdep"; set +a
+    DPKG="${PKG:-${pkgname:-$dep}}"; DVER="${VER:-${pkgver:-0}}"; DPKGID="$DPKG-$DVER"
+    if is_installed "$DPKGID"; then ok "dep já instalada: $DPKGID"; else cmd_install "$dep"; fi
+  done
+  # recarregar a receita do alvo (variáveis podem ter sido sobrescritas)
+  load_rc "$1"
+
+  # 2) build (gera $PKGARCHIVE e $DESTDIR)
+  cmd_build "$1"
+
+  # 3) gerar manifesto ANTES de copiar (para rollback)
+  write_manifest_from_destdir
+
+  # 4) instalar no sistema
+  trap 'warn "falha detectada — executando rollback"; rollback_installed; exit 1' INT TERM HUP
+  if install_to_root; then
+    # 5) pós-instalação & marcar instalado
+    post_install_root
+    mark_installed
+    ok "instalado: $PKGID"
+  else
+    rollback_installed
+    die "instalação falhou: $PKGID"
+  fi
+  trap - INT TERM HUP
+}
+
+# ------------------------------ REMOVE/LIST/INFO/LOG -------------------------
+cmd_remove(){
+  name=$1
+  case "$name" in
+    *-*) pkgid="$name" ;;
+    *)
+      m=$(ls -1 "$VARDB/installed" 2>/dev/null | grep -E "^${name}-" || true)
+      [ -n "$m" ] || die "não instalado: $name"
+      cnt=$(printf '%s\n' "$m" | wc -l | tr -d ' ')
+      [ "$cnt" -eq 1 ] || die "múltiplas versões para $name; use <nome>-<ver>"
+      pkgid="$m"
+      ;;
+  esac
+  instdir="$VARDB/installed/$pkgid"
+  [ -d "$instdir" ] || die "não instalado: $pkgid"
+  manifest="$instdir/manifest.txt"
+  [ -f "$manifest" ] || die "manifesto ausente: $pkgid"
+
+  log "removendo $pkgid"
+  awk '{print length, $0}' "$manifest" | sort -rn | cut -d' ' -f2- |
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    p="$ROOT/$f"
+    if [ -L "$p" ] || [ -f "$p" ]; then rm -f "$p" 2>/dev/null || true
+    elif [ -d "$p" ]; then rmdir "$p" 2>/dev/null || rm -rf "$p" 2>/dev/null || true
+    fi
+  done
+
+  RCEX="$instdir/recipe.rc"
+  if [ -f "$RCEX" ]; then
+    set -a; . "$RCEX"; set +a
+    if [ -n "${REMOVE_CMDS:-}" ]; then
+      log "REMOVE_CMDS ($pkgid)"
+      ( cd "$ROOT" && sh -c "$REMOVE_CMDS" ) || true
+    fi
+  fi
+
+  rm -rf "$instdir"
+  ok "removido: $pkgid"
+}
+
+cmd_list(){ [ -d "$VARDB/installed" ] || { echo "(vazio)"; return 0; }; ls -1 "$VARDB/installed" 2>/dev/null | sort; }
+
+cmd_info(){
+  name=$1
+  dir="$VARDB/installed/$name"
+  [ -d "$dir" ] || die "não instalado: $name"
+  [ -f "$dir/meta" ] && cat "$dir/meta"
+  echo "--- receita ---"
+  sed -n '1,200p' "$dir/recipe.rc"
+}
+
+cmd_log(){
+  name=$1
+  dir="$LOGDIR"
+  if [ -d "$dir/$name" ]; then
+    ls -1 "$dir/$name" | sort
+  else
+    # lista todos que combinam
+    ls -1 "$dir" 2>/dev/null | grep -i -- "$name" || echo "(sem logs)"
+  fi
+}
+
+# ------------------------------- UPDATE/REBUILD/GRAPH ------------------------
+cmd_update(){
+  any=0
+  for p in $(split_paths "$REPO_PATHS"); do
+    [ -d "$p/../.git" ] || continue
+    any=1
+    (cd "$p/.." && git pull --ff-only)
+  done
+  [ $any -eq 1 ] && ok "repos atualizados" || warn "nenhum repo git detectado"
+}
+
+cmd_graph(){
+  load_rc "$1"
+  echo "$PKG"
+  _graph_visit "$PKG" "  "
+}
+_graph_visit(){
+  pkg="$1"; indent="$2"
+  rc=$(find_recipe "$pkg" 2>/dev/null || true) || true
+  [ -n "$rc" ] || return 0
+  set -a; . "$rc"; set +a
+  deps_local="${DEPS:-${deps:-}}"
+  for d in $deps_local; do
+    printf '%s%s\n' "$indent" "$d"
+    _graph_visit "$d" "  $indent"
+  done
+}
+
+cmd_rebuild(){
+  FORCE=0; [ "${1:-}" = "--force" ] && FORCE=1
+  # agregue todas as receitas de todos os paths
+  pkgs=""
+  for p in $(split_paths "$REPO_PATHS"); do
+    [ -d "$p" ] || continue
+    for f in $(find "$p" -type f -name '*.rc' -printf '%f\n' 2>/dev/null); do
+      n=$(printf '%s' "$f" | sed 's/\.rc$//')
+      case " $pkgs " in *" $n "*) : ;; *) pkgs="$pkgs $n";; esac
+    done
+  done
+
+  # ordem topo: visita cada um (com ciclo detection)
+  ORDER=""
+  VISITED=""
+  TEMP=""
+  topo_visit(){
+    n="$1"
+    case " $VISITED " in *" $n "*) return ;; esac
+    case " $TEMP " in *" $n "*) die "ciclo de dependências em $n" ;; esac
+    TEMP="$TEMP $n"
+    rc=$(find_recipe "$n" 2>/dev/null || true) || true
+    if [ -n "$rc" ]; then
+      set -a; . "$rc"; set +a
+      for d in ${DEPS:-${deps:-}}; do topo_visit "$d"; done
+    fi
+    TEMP=$(printf '%s' "$TEMP" | sed "s/ $n//")
+    VISITED="$VISITED $n"
+    ORDER="$ORDER $n"
+  }
+  for p in $pkgs; do topo_visit "$p"; done
+
+  for p in $ORDER; do
+    rc=$(find_recipe "$p" 2>/dev/null || true) || { warn "sem receita: $p"; continue; }
+    set -a; . "$rc"; set +a
+    P="${PKG:-${pkgname:-$p}}"
+    V="${VER:-${pkgver:-0}}"
+    if [ $FORCE -eq 1 ]; then cmd_install "$p" --force
+    else
+      if is_installed "$P-$V"; then ok "skip $P-$V (instalado)"; else cmd_install "$p"; fi
+    fi
+  done
+  ok "rebuild concluído"
+}
+
+cmd_prepare(){ mkpaths; load_rc "$1"; install_deps_resolved "$PKG"; cmd_patch "$1"; ok "prepare concluído"; }
+
+# --------------------------------- USO ---------------------------------------
+usage(){
+  cat <<EOF
+uso: $0 <comando> [args]
+
+comandos:
+  search   <termo>                         procura pacotes nos repositórios
+  install  <nome|arquivo.rc> [--force]     build+install com rollback e manifesto
+  build    <nome|arquivo.rc>               build+empacota (sem instalar)
+  fetch    <nome|arquivo.rc>               baixa fontes e verifica SHA256
+  extract  <nome|arquivo.rc>               baixa+extrai
+  patch    <nome|arquivo.rc>               aplica patches (variável e diretório)
+  deps     <nome>                           resolve e instala dependências
+  remove   <nome[-ver]>                    remove via manifesto + REMOVE_CMDS
+  list                                     lista pacotes instalados
+  info     <nome[-ver]>                    metadados e receita salva
+  log      <nome|nome-versao>              lista logs do pacote
+  update                                   git pull nos repositórios detectados
+  rebuild  [--force]                       recompila tudo em ordem (topo sort)
+  graph    <nome>                          imprime árvore de dependências
+  prepare  <nome|arquivo.rc>               fetch+extract+patch+deps (sem build)
+
+variáveis globais (sobrescreva em /etc/srcmgr.conf ou ~/.config/srcmgr.conf):
+  ROOT REPO RECIPES_DIR WORK DL DESTDIR PKGDIR VARDB LOGDIR JOBS PKGCOMP
+  USE_COLOR USE_SPINNER REPO_PATHS
+EOF
+}
+
+# --------------------------------- Main --------------------------------------
+[ $# -ge 1 ] || { usage; exit 1; }
+
+case "$1" in
+  search)  shift; [ $# -ge 1 ] || die "uso: search <termo>"; cmd_search "$1";;
+  install) shift; [ $# -ge 1 ] || die "uso: install <nome|arquivo.rc> [--force]"; cmd_install "$@";;
+  build)   shift; [ $# -ge 1 ] || die "uso: build <nome|arquivo.rc>"; cmd_build "$1";;
+  fetch)   shift; [ $# -ge 1 ] || die "uso: fetch <nome|arquivo.rc>"; cmd_fetch "$1";;
+  extract) shift; [ $# -ge 1 ] || die "uso: extract <nome|arquivo.rc>"; cmd_extract "$1";;
+  patch)   shift; [ $# -ge 1 ] || die "uso: patch <nome|arquivo.rc>"; cmd_patch "$1";;
+  deps)    shift; [ $# -ge 1 ] || die "uso: deps <nome>"; install_deps_resolved "$1";;
+  remove)  shift; [ $# -ge 1 ] || die "uso: remove <nome[-ver]>"; cmd_remove "$1";;
+  list)    cmd_list;;
+  info)    shift; [ $# -ge 1 ] || die "uso: info <nome[-ver]>"; cmd_info "$1";;
+  log)     shift; [ $# -ge 1 ] || die "uso: log <nome|nome-versao>"; cmd_log "$1";;
+  update)  cmd_update;;
+  rebuild) shift; cmd_rebuild "${1:-}";;
+  graph)   shift; [ $# -ge 1 ] || die "uso: graph <nome>"; cmd_graph "$1";;
+  prepare) shift; [ $# -ge 1 ] || die "uso: prepare <nome|arquivo.rc>"; cmd_prepare "$1";;
+  help|-h|--help) usage;;
+  *) die "comando desconhecido: $1";;
+esac
